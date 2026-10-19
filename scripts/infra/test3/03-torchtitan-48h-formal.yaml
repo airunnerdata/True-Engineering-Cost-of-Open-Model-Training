@@ -1,0 +1,372 @@
+# TorchTitan Llama 3.1 70B — FORMAL 48-hour Test 3 run
+# 2 nodes × 8 B300 GPUs = 16 GPUs total, TP=8 + DP=2
+# Streams C4 dataset from HuggingFace (no PVC required)
+# Checkpoints to NVMe via hostPath (/mnt/torchtitan-ckpt → /dev/nvme0n1)
+#
+# PRE-TEST MANIFEST
+#   Model             : Llama 3.1 70B (llama3 / 70B)
+#   Parameter count   : 70,553,706,496
+#   Training script   : TorchTitan (torchtitan.train)
+#   Parallelism       : TP=8, DP_shard=2 (16 GPUs total)
+#   Checkpoint interval: 25 steps (~26 min)
+#   Failure schedule  : T+4h pod eviction, T+12h node cordon, T+24h pod eviction
+#   Dataset           : allenai/c4 (streamed, no local copy)
+#   Hardware          : 2× Crusoe B300 (288 GB HBM each), InfiniBand
+#   Nodes             : np-5a337c1f-2 (master), np-5a337c1f-3 (worker)
+#
+# Prerequisites:
+#   - Kubeflow Training Operator installed
+#   - HuggingFace token secret: kubectl create secret generic hf-token \
+#       --from-literal=token=<YOUR_HF_TOKEN> -n training
+#   - NVMe mounted: /mnt/torchtitan-ckpt (via nvme-mounter DaemonSet)
+#   - training-critical PriorityClass applied
+#
+# Apply:   kubectl apply -f scripts/infra/test3/03-torchtitan-48h-formal.yaml -n training
+# Logs:    kubectl logs -f -n training $(kubectl get pods -n training \
+#            -l training.kubeflow.org/job-name=torchtitan-surf-t3,training.kubeflow.org/replica-type=master \
+#            -o name)
+# Steps:   kubectl exec -n training <master-pod> -- grep "step:" /outputs/logs/train-rank0.log | tail -1
+# Clean:   kubectl delete -f scripts/infra/test3/03-torchtitan-48h-formal.yaml -n training
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: torchtitan-surf-t3-config
+  namespace: training
+data:
+  train.toml: |
+    [job]
+    dump_folder = "/outputs"
+    description = "Surf Report Test 3 — FORMAL — Llama 3.1 70B, 48h, 2x B300"
+
+    [profiling]
+    enable_profiling = false
+    save_traces_folder = "/outputs/profile_trace"
+    profile_freq = 100
+
+    [metrics]
+    log_freq = 50
+    enable_tensorboard = false
+
+    [model]
+    name = "llama3"
+    flavor = "70B"
+    hf_assets_path = "/workspace/torchtitan/assets/hf/Llama-3.1-8B"
+
+    [optimizer]
+    name = "AdamW"
+    lr = 3e-4
+    eps = 1e-8
+
+    [lr_scheduler]
+    warmup_steps = 200
+
+    [training]
+    local_batch_size = 4
+    seq_len = 8192
+    max_norm = 1.0
+    steps = 500000
+    dataset = "c4"
+
+    [parallelism]
+    data_parallel_replicate_degree = 1
+    data_parallel_shard_degree = 2
+    tensor_parallel_degree = 8
+    pipeline_parallel_degree = 1
+    context_parallel_degree = 1
+
+    [checkpoint]
+    enable = true
+    folder = "/outputs/checkpoint"
+    interval = 25
+    keep_latest_k = 2
+    last_save_model_only = true
+    async_mode = "async"
+
+    [compile]
+    enable = true
+
+    [activation_checkpoint]
+    mode = "selective"
+
+    [comm]
+    init_timeout_seconds = 7200
+    train_timeout_seconds = 900
+---
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: torchtitan-surf-t3
+  namespace: training
+spec:
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        spec:
+          priorityClassName: training-critical
+          nodeSelector:
+            kubernetes.io/hostname: np-5a337c1f-2.eu-iceland1-a.compute.internal
+          containers:
+            - name: pytorch
+              image: ghcr.io/datadoc24/torchtitan-llama3-8b:latest
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                capabilities:
+                  add: ["IPC_LOCK"]
+              workingDir: /workspace/torchtitan
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -o pipefail
+                  mkdir -p /outputs/logs /outputs/hf_cache /tmp/pysite
+
+                  # Pre-warm HF datasets cache (single-process, before torchrun stampede).
+                  # Write to file first so Python code indentation is not YAML-sensitive.
+                  cat > /tmp/prewarm.py << 'PYEOF'
+                  from datasets import load_dataset
+                  import sys
+                  ds = load_dataset('allenai/c4', 'en', split='train', streaming=True,
+                                    trust_remote_code=True, cache_dir='/outputs/hf_cache')
+                  it = iter(ds)
+                  _ = next(it)
+                  print('[pre-warm] C4 cache primed OK')
+                  PYEOF
+                  echo "[pre-warm] $(date -u) Priming C4 dataset cache..."
+                  HF_DATASETS_CACHE=/outputs/hf_cache python3 /tmp/prewarm.py \
+                    2>&1 | tee -a /outputs/logs/train-rank${RANK}.log || true
+                  echo "[pre-warm] $(date -u) Done."
+
+                  # Defense-in-depth: also patch dist.init_process_group directly.
+                  # Primary fix is [comm] init_timeout_seconds=7200 in train.toml.
+                  cat > /tmp/pysite/sitecustomize.py << 'PYEOF'
+                  try:
+                      import torch.distributed as dist
+                      from datetime import timedelta
+                      _orig = dist.init_process_group
+                      def _patched(*a, **kw):
+                          kw["timeout"] = timedelta(hours=2)
+                          return _orig(*a, **kw)
+                      dist.init_process_group = _patched
+                  except Exception:
+                      pass
+                  PYEOF
+
+                  HF_DATASETS_CACHE=/outputs/hf_cache \
+                  PYTHONPATH=/tmp/pysite:${PYTHONPATH:-} torchrun \
+                    --nproc_per_node=8 \
+                    --nnodes=2 \
+                    --node_rank=${RANK} \
+                    --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
+                    --rdzv_backend=c10d \
+                    -m torchtitan.train \
+                    --job.config_file /config/train.toml \
+                  2>&1 | tee /outputs/logs/train-rank${RANK}.log
+              env:
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-token
+                      key: token
+                - name: HF_DATASETS_CACHE
+                  value: "/outputs/hf_cache"
+                - name: PYTORCH_ALLOC_CONF
+                  value: "expandable_segments:True"
+                - name: NCCL_DEBUG
+                  value: "INFO"
+                - name: NCCL_SOCKET_IFNAME
+                  value: "eth0"
+                - name: NCCL_IB_DISABLE
+                  value: "0"
+                - name: NCCL_IB_GID_INDEX
+                  value: "0"
+                - name: NCCL_NET_GDR_LEVEL
+                  value: "0"
+                - name: NCCL_TOPO_FILE
+                  value: /opt/nccl_topo/b300-288gb-sxm-ib-cloud-hypervisor.xml
+                - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+                  value: "7200"
+                - name: TORCH_DISTRIBUTED_TIMEOUT
+                  value: "7200"
+              resources:
+                limits:
+                  nvidia.com/gpu: "8"
+                  nvidia.com/hostdev: "8"
+                  memory: "512Gi"
+                  ephemeral-storage: "50Gi"
+                requests:
+                  nvidia.com/gpu: "8"
+                  nvidia.com/hostdev: "8"
+                  memory: "512Gi"
+                  ephemeral-storage: "50Gi"
+              volumeMounts:
+                - name: config
+                  mountPath: /config
+                - name: outputs
+                  mountPath: /outputs
+                - name: dshm
+                  mountPath: /dev/shm
+                - name: nccl-topo
+                  mountPath: /opt/nccl_topo
+                - name: infiniband
+                  mountPath: /dev/infiniband
+          volumes:
+            - name: config
+              configMap:
+                name: torchtitan-surf-t3-config
+            - name: outputs
+              hostPath:
+                path: /mnt/torchtitan-ckpt
+                type: DirectoryOrCreate
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: "64Gi"
+            - name: nccl-topo
+              hostPath:
+                path: /etc/crusoe/nccl_topo
+                type: Directory
+            - name: infiniband
+              hostPath:
+                path: /dev/infiniband
+                type: Directory
+
+    Worker:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        spec:
+          priorityClassName: training-critical
+          nodeSelector:
+            kubernetes.io/hostname: np-5a337c1f-3.eu-iceland1-a.compute.internal
+          tolerations:
+            - key: node.kubernetes.io/disk-pressure
+              operator: Exists
+              effect: NoSchedule
+            - key: node.kubernetes.io/memory-pressure
+              operator: Exists
+              effect: NoSchedule
+          containers:
+            - name: pytorch
+              image: ghcr.io/datadoc24/torchtitan-llama3-8b:latest
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                capabilities:
+                  add: ["IPC_LOCK"]
+              workingDir: /workspace/torchtitan
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -o pipefail
+                  mkdir -p /outputs/logs /outputs/hf_cache /tmp/pysite
+
+                  # Pre-warm HF datasets cache (single-process, before torchrun stampede).
+                  cat > /tmp/prewarm.py << 'PYEOF'
+                  from datasets import load_dataset
+                  import sys
+                  ds = load_dataset('allenai/c4', 'en', split='train', streaming=True,
+                                    trust_remote_code=True, cache_dir='/outputs/hf_cache')
+                  it = iter(ds)
+                  _ = next(it)
+                  print('[pre-warm] C4 cache primed OK')
+                  PYEOF
+                  echo "[pre-warm] $(date -u) Priming C4 dataset cache..."
+                  HF_DATASETS_CACHE=/outputs/hf_cache python3 /tmp/prewarm.py \
+                    2>&1 | tee -a /outputs/logs/train-rank${RANK}.log || true
+                  echo "[pre-warm] $(date -u) Done."
+
+                  # Defense-in-depth: also patch dist.init_process_group directly.
+                  cat > /tmp/pysite/sitecustomize.py << 'PYEOF'
+                  try:
+                      import torch.distributed as dist
+                      from datetime import timedelta
+                      _orig = dist.init_process_group
+                      def _patched(*a, **kw):
+                          kw["timeout"] = timedelta(hours=2)
+                          return _orig(*a, **kw)
+                      dist.init_process_group = _patched
+                  except Exception:
+                      pass
+                  PYEOF
+
+                  HF_DATASETS_CACHE=/outputs/hf_cache \
+                  PYTHONPATH=/tmp/pysite:${PYTHONPATH:-} torchrun \
+                    --nproc_per_node=8 \
+                    --nnodes=2 \
+                    --node_rank=${RANK} \
+                    --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
+                    --rdzv_backend=c10d \
+                    -m torchtitan.train \
+                    --job.config_file /config/train.toml \
+                  2>&1 | tee /outputs/logs/train-rank${RANK}.log
+              env:
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-token
+                      key: token
+                - name: HF_DATASETS_CACHE
+                  value: "/outputs/hf_cache"
+                - name: PYTORCH_ALLOC_CONF
+                  value: "expandable_segments:True"
+                - name: NCCL_DEBUG
+                  value: "INFO"
+                - name: NCCL_SOCKET_IFNAME
+                  value: "eth0"
+                - name: NCCL_IB_DISABLE
+                  value: "0"
+                - name: NCCL_IB_GID_INDEX
+                  value: "0"
+                - name: NCCL_NET_GDR_LEVEL
+                  value: "0"
+                - name: NCCL_TOPO_FILE
+                  value: /opt/nccl_topo/b300-288gb-sxm-ib-cloud-hypervisor.xml
+                - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+                  value: "7200"
+                - name: TORCH_DISTRIBUTED_TIMEOUT
+                  value: "7200"
+              resources:
+                limits:
+                  nvidia.com/gpu: "8"
+                  nvidia.com/hostdev: "8"
+                  memory: "512Gi"
+                  ephemeral-storage: "50Gi"
+                requests:
+                  nvidia.com/gpu: "8"
+                  nvidia.com/hostdev: "8"
+                  memory: "512Gi"
+                  ephemeral-storage: "50Gi"
+              volumeMounts:
+                - name: config
+                  mountPath: /config
+                - name: outputs
+                  mountPath: /outputs
+                - name: dshm
+                  mountPath: /dev/shm
+                - name: nccl-topo
+                  mountPath: /opt/nccl_topo
+                - name: infiniband
+                  mountPath: /dev/infiniband
+          volumes:
+            - name: config
+              configMap:
+                name: torchtitan-surf-t3-config
+            - name: outputs
+              hostPath:
+                path: /mnt/torchtitan-ckpt
+                type: DirectoryOrCreate
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: "64Gi"
+            - name: nccl-topo
+              hostPath:
+                path: /etc/crusoe/nccl_topo
+                type: Directory
+            - name: infiniband
+              hostPath:
+                path: /dev/infiniband
+                type: Directory

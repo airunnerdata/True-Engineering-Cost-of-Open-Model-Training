@@ -1,0 +1,112 @@
+# NCCL pre-flight test — 2-node, 16-GPU all_reduce_perf sweep
+# Validates InfiniBand connectivity and bandwidth between B300 nodes
+# before committing to a 24-hour training run.
+#
+# Expected result: ~300+ GB/s bus bandwidth on B300 with IB
+#
+# Apply:  kubectl apply -f scripts/infra/test3/01-nccl-test.yaml
+# Logs:   kubectl logs -f -n training $(kubectl get pods -n training -l training.kubeflow.org/job-name=nccl-test-b300,training.kubeflow.org/replica-type=launcher -o name)
+# Clean:  kubectl delete -f scripts/infra/test3/01-nccl-test.yaml
+---
+apiVersion: kubeflow.org/v1
+kind: MPIJob
+metadata:
+  name: nccl-test-b300
+  namespace: training
+spec:
+  slotsPerWorker: 8
+  runPolicy:
+    cleanPodPolicy: Running
+  mpiReplicaSpecs:
+    Launcher:
+      replicas: 1
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: nccl-test-launcher
+              image: abesharphpe/nccl-tests-b300:latest
+              env:
+                - name: NCCL_DEBUG
+                  value: "WARN"
+                - name: NCCL_TOPO_FILE
+                  value: /opt/nccl_topo/b300-288gb-sxm-ib-cloud-hypervisor.xml
+                - name: NCCL_IB_HCA
+                  value: "mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11,mlx5_12"
+                - name: NCCL_IB_GID_INDEX
+                  value: "3"
+                - name: NCCL_NET_GDR_LEVEL
+                  value: "SYS"
+                - name: NCCL_NVLS_ENABLE
+                  value: "1"
+                - name: UCX_RNDV_SCHEME
+                  value: "get_zcopy"
+                - name: UCX_TLS
+                  value: "self,sm,cuda_copy"
+              command:
+                - /opt/amazon/openmpi/bin/mpirun
+                - --allow-run-as-root
+                - -np
+                - "16"
+                - -N
+                - "8"
+                - -x
+                - NCCL_DEBUG
+                - -x
+                - NCCL_TOPO_FILE
+                - -x
+                - NCCL_IB_HCA
+                - -x
+                - NCCL_IB_GID_INDEX
+                - -x
+                - NCCL_NET_GDR_LEVEL
+                - -x
+                - NCCL_NVLS_ENABLE
+                - /opt/nccl-tests/build/all_reduce_perf
+                - -b
+                - "2G"
+                - -e
+                - "32G"
+                - -f
+                - "2"
+                - -t
+                - "1"
+                - -g
+                - "1"
+                - -c
+                - "1"
+                - -n
+                - "100"
+    Worker:
+      replicas: 2
+      template:
+        spec:
+          containers:
+            - name: nccl-test-worker
+              image: abesharphpe/nccl-tests-b300:latest
+              resources:
+                limits:
+                  nvidia.com/gpu: "8"
+                  nvidia.com/hostdev: "8"
+                  memory: "256Gi"
+                requests:
+                  nvidia.com/gpu: "8"
+                  nvidia.com/hostdev: "8"
+                  memory: "256Gi"
+              securityContext:
+                capabilities:
+                  add: ["IPC_LOCK"]
+              volumeMounts:
+                - name: dshm
+                  mountPath: /dev/shm
+                - name: infiniband
+                  mountPath: /dev/infiniband
+          volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: "64Gi"
+            - name: infiniband
+              hostPath:
+                path: /dev/infiniband
+                type: Directory

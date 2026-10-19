@@ -1,0 +1,371 @@
+{
+  "__inputs": [],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "9.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" }
+  ],
+  "id": null,
+  "uid": "surf-test01",
+  "title": "Surf Report — Test 1: Architecture Before/After",
+  "description": "vLLM inference metrics: TTFT latency, queue depth, prefix cache hit rate, KV cache usage, GPU utilization.",
+  "tags": ["surf-report", "test-01"],
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "timepicker": {},
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "panels": [
+
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "⏱  Time to First Token (TTFT)  —  p50 / p95 / p99",
+      "description": "Milliseconds from request send to first streamed token. Lower is better. Burst phases highlighted by queue depth spikes.",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 9 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, stack) (rate(vllm:time_to_first_token_seconds_bucket[1m]))) * 1000",
+          "legendFormat": "{{stack}}  p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, stack) (rate(vllm:time_to_first_token_seconds_bucket[1m]))) * 1000",
+          "legendFormat": "{{stack}}  p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, stack) (rate(vllm:time_to_first_token_seconds_bucket[1m]))) * 1000",
+          "legendFormat": "{{stack}}  p99",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 500 },
+              { "color": "red", "value": 2000 }
+            ]
+          }
+        },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": "p99" },
+            "properties": [{ "id": "custom.lineStyle", "value": { "dash": [6, 3], "fill": "dash" } }] },
+          { "matcher": { "id": "byRegexp", "options": "p50" },
+            "properties": [{ "id": "custom.lineStyle", "value": { "dash": [2, 2], "fill": "dash" } }] }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max", "mean"] },
+        "tooltip": { "mode": "multi", "sort": "asc" }
+      }
+    },
+
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "🔢  Queue Depth — Requests Waiting & Running",
+      "description": "requests_waiting > 5 = blocking event. Spikes indicate GPU saturation during bursts.",
+      "gridPos": { "x": 0, "y": 9, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "vllm:num_requests_waiting",
+          "legendFormat": "{{stack}}  waiting",
+          "refId": "A"
+        },
+        {
+          "expr": "vllm:num_requests_running",
+          "legendFormat": "{{stack}}  running",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "spanNulls": true }
+        },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": "waiting" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
+              { "id": "custom.fillOpacity", "value": 20 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "thresholds": {
+        "mode": "absolute",
+        "steps": [
+          { "color": "green", "value": null },
+          { "color": "red", "value": 5 }
+        ]
+      }
+    },
+
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "🎯  Prefix Cache Hit Rate (%)",
+      "description": "Δhits / Δqueries × 100 over 1-minute window. Crusoe's shared KV cache should sustain ~99% with a fixed system prompt. Baseline round-robin will be lower.",
+      "gridPos": { "x": 12, "y": 9, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "rate(vllm:prefix_cache_hits_total[1m]) / rate(vllm:prefix_cache_queries_total[1m]) * 100",
+          "legendFormat": "{{stack}}  hit rate",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 15, "showPoints": "never", "spanNulls": false },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red",    "value": null },
+              { "color": "yellow", "value": 50 },
+              { "color": "green",  "value": 80 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "mean"] },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "💾  KV Cache Usage (%)",
+      "description": "Fraction of the GPU KV cache in use. High sustained usage during bursts indicates memory pressure.",
+      "gridPos": { "x": 0, "y": 17, "w": 8, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "vllm:kv_cache_usage_perc * 100",
+          "legendFormat": "{{stack}}  KV cache",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "spanNulls": true },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 70 },
+              { "color": "red",    "value": 90 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "⚡  GPU Utilization (%)",
+      "description": "SM utilization from DCGM. Sustained 100% during bursts = GPU-bound, not software-bound.",
+      "gridPos": { "x": 8, "y": 17, "w": 8, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_GPU_UTIL{stack=~\".+\"}",
+          "legendFormat": "{{stack}}  {{gpu}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 12, "showPoints": "never", "spanNulls": true },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue",   "value": null },
+              { "color": "green",  "value": 50 },
+              { "color": "orange", "value": 90 },
+              { "color": "red",    "value": 99 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "🧠  GPU Memory Used (MiB)",
+      "description": "GPU framebuffer memory consumed. Model weights are fixed; increases indicate growing KV cache.",
+      "gridPos": { "x": 16, "y": 17, "w": 8, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_FB_USED{stack=~\".+\"}",
+          "legendFormat": "{{stack}}  used",
+          "refId": "A"
+        },
+        {
+          "expr": "DCGM_FI_DEV_FB_USED{stack=~\".+\"} + DCGM_FI_DEV_FB_FREE{stack=~\".+\"}",
+          "legendFormat": "{{stack}}  total",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "mebibytes",
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 8, "showPoints": "never", "spanNulls": true }
+        },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": "total" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "dash": [4, 4], "fill": "dash" } },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "🔥  GPU Power Draw (W)",
+      "description": "Sustained high wattage during inference = full GPU engagement. Useful for cost-efficiency calculations.",
+      "gridPos": { "x": 0, "y": 24, "w": 12, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_POWER_USAGE{stack=~\".+\"}",
+          "legendFormat": "{{stack}}  power (W)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "watt",
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "spanNulls": true }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "📊  Prompt Tokens Processed (cumulative)",
+      "description": "vllm:prompt_tokens_total (counter). The gap between total and cached tokens = tokens that required actual prefill compute.",
+      "gridPos": { "x": 12, "y": 24, "w": 12, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "rate(vllm:prompt_tokens_total[1m])",
+          "legendFormat": "{{stack}}  prompt tokens/s",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(vllm:prompt_tokens_cached_total[1m])",
+          "legendFormat": "{{stack}}  cached tokens/s",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(vllm:generation_tokens_total[1m])",
+          "legendFormat": "{{stack}}  generation tokens/s",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 6, "showPoints": "never", "spanNulls": true }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "mean"] },
+        "tooltip": { "mode": "multi" }
+      }
+    }
+
+  ],
+
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "label": "Datasource"
+      }
+    ]
+  },
+
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+
+  "links": []
+}

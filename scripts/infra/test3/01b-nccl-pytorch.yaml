@@ -1,0 +1,229 @@
+# NCCL allreduce bandwidth benchmark via PyTorchJob
+# Replaces MPIJob approach (kubectl exec is unavailable on Crusoe B300 cluster).
+# Uses torchrun / torch.distributed — pure TCP rendezvous, no exec needed.
+#
+# Sweeps 2G → 32G allreduce (matching NCCL-tests convention).
+# Expected: ~300+ GB/s bus bandwidth on 2-node B300 with IB.
+#
+# Apply:  kubectl apply -f scripts/infra/test3/01b-nccl-pytorch.yaml -n training
+# Logs:   kubectl logs -f -n training $(kubectl get pods -n training \
+#           -l training.kubeflow.org/job-name=nccl-bw-test,training.kubeflow.org/replica-type=master \
+#           -o name)
+# Clean:  kubectl delete -f scripts/infra/test3/01b-nccl-pytorch.yaml -n training
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nccl-bw-script
+  namespace: training
+data:
+  bench.py: |
+    import torch
+    import torch.distributed as dist
+    import time, os, sys
+
+    dist.init_process_group(backend="nccl")
+    rank       = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+
+    # Sizes: 2G, 4G, 8G, 16G, 32G  (elements of float32)
+    sizes_bytes = [2 << 30, 4 << 30, 8 << 30, 16 << 30, 32 << 30]
+
+    WARMUP = 20
+    ITERS  = 100
+
+    if rank == 0:
+        print(f"world_size={world_size}  GPUs per node=8", flush=True)
+        print(f"{'Size':>8}  {'Avg BW GB/s':>14}  {'Min BW GB/s':>14}", flush=True)
+
+    for size_bytes in sizes_bytes:
+        n_elem = size_bytes // 4          # float32
+        tensor = torch.zeros(n_elem, dtype=torch.float32, device="cuda")
+
+        # warmup
+        for _ in range(WARMUP):
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        # timed
+        t0 = time.perf_counter()
+        for _ in range(ITERS):
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        del tensor
+
+        elapsed = t1 - t0
+        # Bus-bandwidth formula: 2*(n-1)/n * bytes / time
+        bw = 2.0 * (world_size - 1) / world_size * size_bytes * ITERS / elapsed / 1e9
+
+        if rank == 0:
+            size_str = f"{size_bytes >> 30}G"
+            print(f"{size_str:>8}  {bw:>14.2f}  {bw:>14.2f}", flush=True)
+
+    dist.barrier()
+    dist.destroy_process_group()
+    if rank == 0:
+        print("NCCL benchmark complete.", flush=True)
+---
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: nccl-bw-test
+  namespace: training
+spec:
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        spec:
+          nodeSelector:
+            kubernetes.io/hostname: np-1a73d660-2.eu-iceland1-a.compute.internal
+          containers:
+            - name: pytorch
+              image: ghcr.io/datadoc24/torchtitan-llama3-8b:latest
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                capabilities:
+                  add: ["IPC_LOCK"]
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  torchrun \
+                    --nproc_per_node=8 \
+                    --nnodes=2 \
+                    --node_rank=${RANK} \
+                    --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
+                    --rdzv_backend=c10d \
+                    /config/bench.py
+              env:
+                - name: NCCL_DEBUG
+                  value: "INFO"
+                - name: NCCL_SOCKET_IFNAME
+                  value: "eth0"
+                - name: NCCL_IB_DISABLE
+                  value: "0"
+                - name: NCCL_IB_HCA
+                  value: "mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11,mlx5_12"
+                - name: NCCL_IB_GID_INDEX
+                  value: "3"
+                - name: NCCL_NET_GDR_LEVEL
+                  value: "SYS"
+                - name: NCCL_NVLS_ENABLE
+                  value: "1"
+                - name: NCCL_TOPO_FILE
+                  value: /opt/nccl_topo/b300-288gb-sxm-ib-cloud-hypervisor.xml
+              resources:
+                limits:
+                  nvidia.com/gpu: "8"
+                  nvidia.com/hostdev: "8"
+                  memory: "256Gi"
+                requests:
+                  nvidia.com/gpu: "8"
+                  nvidia.com/hostdev: "8"
+                  memory: "256Gi"
+              volumeMounts:
+                - name: config
+                  mountPath: /config
+                - name: dshm
+                  mountPath: /dev/shm
+                - name: nccl-topo
+                  mountPath: /opt/nccl_topo
+                - name: infiniband
+                  mountPath: /dev/infiniband
+          volumes:
+            - name: config
+              configMap:
+                name: nccl-bw-script
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: "64Gi"
+            - name: nccl-topo
+              hostPath:
+                path: /etc/crusoe/nccl_topo
+                type: Directory
+            - name: infiniband
+              hostPath:
+                path: /dev/infiniband
+                type: Directory
+
+    Worker:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        spec:
+          containers:
+            - name: pytorch
+              image: ghcr.io/datadoc24/torchtitan-llama3-8b:latest
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                capabilities:
+                  add: ["IPC_LOCK"]
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  torchrun \
+                    --nproc_per_node=8 \
+                    --nnodes=2 \
+                    --node_rank=${RANK} \
+                    --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
+                    --rdzv_backend=c10d \
+                    /config/bench.py
+              env:
+                - name: NCCL_DEBUG
+                  value: "INFO"
+                - name: NCCL_SOCKET_IFNAME
+                  value: "eth0"
+                - name: NCCL_IB_DISABLE
+                  value: "0"
+                - name: NCCL_IB_HCA
+                  value: "mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11,mlx5_12"
+                - name: NCCL_IB_GID_INDEX
+                  value: "3"
+                - name: NCCL_NET_GDR_LEVEL
+                  value: "SYS"
+                - name: NCCL_NVLS_ENABLE
+                  value: "1"
+                - name: NCCL_TOPO_FILE
+                  value: /opt/nccl_topo/b300-288gb-sxm-ib-cloud-hypervisor.xml
+              resources:
+                limits:
+                  nvidia.com/gpu: "8"
+                  nvidia.com/hostdev: "8"
+                  memory: "256Gi"
+                requests:
+                  nvidia.com/gpu: "8"
+                  nvidia.com/hostdev: "8"
+                  memory: "256Gi"
+              volumeMounts:
+                - name: config
+                  mountPath: /config
+                - name: dshm
+                  mountPath: /dev/shm
+                - name: nccl-topo
+                  mountPath: /opt/nccl_topo
+                - name: infiniband
+                  mountPath: /dev/infiniband
+          volumes:
+            - name: config
+              configMap:
+                name: nccl-bw-script
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: "64Gi"
+            - name: nccl-topo
+              hostPath:
+                path: /etc/crusoe/nccl_topo
+                type: Directory
+            - name: infiniband
+              hostPath:
+                path: /dev/infiniband
+                type: Directory

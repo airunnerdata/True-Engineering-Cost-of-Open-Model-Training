@@ -1,0 +1,69 @@
+# NFS server pod on master node — exports 4TB block PVC as shared filesystem
+# All training pods mount /exports via NFS service IP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-block-pvc
+  namespace: training
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: compute-csi-default-sc
+  resources:
+    requests:
+      storage: 4096Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nfs-server
+  namespace: training
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nfs-server
+  template:
+    metadata:
+      labels:
+        app: nfs-server
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: computeinstance-i00dmp4ry7e1nfhd87
+      containers:
+        - name: nfs-server
+          image: k8s.gcr.io/volume-nfs:0.8
+          ports:
+            - containerPort: 2049
+              name: nfs
+            - containerPort: 111
+              name: mountd
+            - containerPort: 111
+              protocol: UDP
+              name: rpcbind
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: storage
+              mountPath: /exports
+      volumes:
+        - name: storage
+          persistentVolumeClaim:
+            claimName: nfs-block-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nfs-server
+  namespace: training
+spec:
+  selector:
+    app: nfs-server
+  ports:
+    - name: nfs
+      port: 2049
+    - name: mountd
+      port: 20048
+    - name: rpcbind
+      port: 111

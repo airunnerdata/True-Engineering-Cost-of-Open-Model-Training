@@ -1,0 +1,39 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: surf-training-test1
+  namespace: training
+spec:
+  # backoffLimit: 0 — do NOT auto-restart after failure.
+  # F1/F2/F4 terminate the pod; recovery is logged manually in the harness.
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: surf-training
+        test: "1"
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: trainer
+          image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+          command: ["python3", "/scripts/surf_train.py"]
+          volumeMounts:
+            - name: training-script
+              mountPath: /scripts
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              memory: "8Gi"
+              cpu: "2"
+            requests:
+              nvidia.com/gpu: "1"
+              memory: "8Gi"
+              cpu: "2"
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+      volumes:
+        - name: training-script
+          configMap:
+            name: surf-train-script

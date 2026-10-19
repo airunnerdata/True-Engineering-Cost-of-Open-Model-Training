@@ -1,0 +1,44 @@
+# NFS PersistentVolume + PVC for the checkpoint store.
+# Applied by 01-setup.sh AFTER the nfs-server Service exists, with __NFS_IP__
+# replaced by the Service ClusterIP:
+#   NFS_IP=$(kubectl get svc nfs-server -n training -o jsonpath='{.spec.clusterIP}')
+#   sed "s/__NFS_IP__/${NFS_IP}/" 02b-nfs-pv.yaml | kubectl apply -f -
+#
+# We mount by ClusterIP (not DNS) because the NFS mount runs in the node's
+# host network namespace via kubelet, which uses VPC DNS — not CoreDNS — so
+# *.svc.cluster.local would not resolve at mount time.
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: surf-ckpt-pv
+spec:
+  capacity:
+    storage: 14400Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  mountOptions:
+    - nfsvers=4.1
+    - hard
+    - timeo=600
+    - retrans=2
+  nfs:
+    server: __NFS_IP__
+    # itsthenetwork/nfs-server-alpine exports /exports with fsid=0, making it
+    # the NFSv4 pseudo-root, so clients mount "/" (not "/exports").
+    path: /
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: surf-ckpt-pvc
+  namespace: training
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 14400Gi
+  volumeName: surf-ckpt-pv
+  storageClassName: ""

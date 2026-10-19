@@ -1,0 +1,113 @@
+# NVMe RAID0 + NFS server for AWS p6-b300 master node
+#
+# p6-b300.48xlarge has 8x 3.7TB instance-store NVMe SSDs (nvme1n1..nvme8n1).
+# An init container RAID0-stripes all 8 (~29.6 TB) and mounts /mnt/ckpt on the
+# host (via Bidirectional mount propagation). The nfs-server container then
+# exports it. Training pods mount the NFS ClusterIP at /outputs.
+#
+# Pinned to the node labeled role=nfs-master (the torchtitan master node).
+# PV/PVC live in 02b-nfs-pv.yaml (applied after this, with the ClusterIP).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: training
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nfs-server
+  namespace: training
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: nfs-server
+  template:
+    metadata:
+      labels:
+        app: nfs-server
+    spec:
+      nodeSelector:
+        role: nfs-master
+      initContainers:
+        - name: nvme-raid
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          securityContext:
+            privileged: true
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              echo "[nvme-raid] installing tools..."
+              dnf install -y mdadm e2fsprogs util-linux >/dev/null 2>&1
+              mkdir -p /mnt/ckpt
+              if mountpoint -q /mnt/ckpt; then
+                echo "[nvme-raid] /mnt/ckpt already mounted; skipping"
+                df -h /mnt/ckpt; exit 0
+              fi
+              DEVS="/dev/nvme1n1 /dev/nvme2n1 /dev/nvme3n1 /dev/nvme4n1 /dev/nvme5n1 /dev/nvme6n1 /dev/nvme7n1 /dev/nvme8n1"
+              if [ ! -b /dev/md0 ]; then
+                echo "[nvme-raid] creating RAID0 across 8 NVMe drives..."
+                yes | mdadm --create --verbose /dev/md0 --level=0 --raid-devices=8 $DEVS --force
+              else
+                echo "[nvme-raid] /dev/md0 exists"
+              fi
+              if ! blkid /dev/md0 | grep -q ext4; then
+                echo "[nvme-raid] formatting ext4..."
+                mkfs.ext4 -F -m 0 /dev/md0
+              fi
+              mount /dev/md0 /mnt/ckpt
+              chmod 1777 /mnt/ckpt
+              echo "[nvme-raid] done:"; df -h /mnt/ckpt
+          volumeMounts:
+            - name: hostmnt
+              mountPath: /mnt
+              mountPropagation: Bidirectional
+            - name: dev
+              mountPath: /dev
+      containers:
+        - name: nfs-server
+          image: itsthenetwork/nfs-server-alpine:12
+          securityContext:
+            privileged: true
+          env:
+            - name: SHARED_DIRECTORY
+              value: /exports
+          ports:
+            - { containerPort: 2049, name: nfs }
+            - { containerPort: 20048, name: mountd }
+            - { containerPort: 111, name: rpcbind }
+            - { containerPort: 111, protocol: UDP, name: rpcbind-udp }
+          volumeMounts:
+            - name: ckpt
+              mountPath: /exports
+              mountPropagation: HostToContainer
+      volumes:
+        - name: hostmnt
+          hostPath:
+            path: /mnt
+            type: DirectoryOrCreate
+        - name: dev
+          hostPath:
+            path: /dev
+        - name: ckpt
+          hostPath:
+            path: /mnt/ckpt
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nfs-server
+  namespace: training
+spec:
+  selector:
+    app: nfs-server
+  ports:
+    - { name: nfs, port: 2049, targetPort: 2049 }
+    - { name: mountd, port: 20048, targetPort: 20048 }
+    - { name: rpcbind, port: 111, targetPort: 111 }

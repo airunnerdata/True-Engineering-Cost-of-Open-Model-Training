@@ -1,0 +1,78 @@
+# EKS cluster for Test 3 — 3x p6-b300.48xlarge (24x B300 GPUs)
+# Capacity reservation: cr-0ab3244a0f33a81b4 (us-west-2b, 3 nodes)
+# Window: 2026-06-09T11:30Z -> 2026-06-11T11:30Z (48h)
+#
+# Create:    eksctl create cluster -f 00-eks-cluster.yaml
+# Teardown:  eksctl delete cluster -f 00-eks-cluster.yaml
+# Kubeconfig: aws eks update-kubeconfig --region us-west-2 --name surf-b300-aws
+
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: surf-b300-aws
+  region: us-west-2
+  version: "1.32"
+  tags:
+    project: surf-benchmark
+    test: test3-aws
+
+vpc:
+  id: vpc-bc27efd9
+  subnets:
+    # Control plane needs >=2 AZs; nodegroup is pinned to us-west-2b (below)
+    # where the capacity reservation and EFA placement group live.
+    public:
+      us-west-2a: { id: subnet-f316b296 }
+      us-west-2b: { id: subnet-3d62984a }
+      us-west-2c: { id: subnet-37d2c871 }
+      us-west-2d: { id: subnet-978cb4bf }
+
+iam:
+  withOIDC: true
+
+managedNodeGroups:
+  - name: p6-b300-nodes
+    instanceType: p6-b300.48xlarge
+    minSize: 3
+    maxSize: 3
+    desiredCapacity: 3
+    availabilityZones: ["us-west-2b"]
+
+    # Target the specific capacity reservation
+    capacityReservation:
+      capacityReservationTarget:
+        capacityReservationID: "cr-0ab3244a0f33a81b4"
+
+    # EFA: eksctl provisions all 16 EFA interfaces per node and installs the
+    # aws-efa-k8s-device-plugin DaemonSet automatically
+    efaEnabled: true
+
+    # NOTE: no explicit placement group. The capacity reservation
+    # (cr-0ab3244a0f33a81b4) already co-locates all 3 nodes in us-west-2b;
+    # adding a cluster placement group on top risks "insufficient capacity
+    # for placement group" errors and gives only marginal latency benefit
+    # at this node count.
+
+    # AL2023 with NVIDIA + EFA drivers pre-installed (selected automatically
+    # by eksctl when efaEnabled=true and instanceType contains GPU)
+    amiFamily: AmazonLinux2023
+
+    ssh:
+      allow: true
+      publicKeyPath: /Users/jake/Dropbox/Benchmarks/Crusoe/bin/surf-crusoe.pem.pub
+
+    iam:
+      withAddonPolicies:
+        imageBuilder: true
+        autoScaler: false
+        ebs: true
+        efs: false
+
+    # Give each node enough labels to target later
+    labels:
+      node-type: gpu
+      instance-type: p6-b300
+
+    tags:
+      test: test3-aws

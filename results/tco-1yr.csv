@@ -1,0 +1,14 @@
+Category,Metric,Crusoe (B300),Nebius (B200),AWS (B300),Unit
+Constants,Points per FTE per week,10,10,10,
+,Hours per week,40,40,40,
+,Work weeks per year,52,52,52,
+,Hours per point,4,4,4,hr
+,Points per FTE-year,520,520,520,
+,Base salary,"150,000","150,000","150,000",USD
+,Fully burdened salary (22%),"183,000","183,000","183,000",USD
+Labor inputs (story points),Provision per run (Test 2),15,15,19,pts
+,Teardown per run (est.),3,4,8,pts
+,"Cold start, one-time (Test 4)",38,42,96,pts
+,"Observability setup, one-time (Test 1)",7,7,49,pts
+,Incident remediation (est.),0.5,0.5,1.5,pts/incident
+,Incidents per run,2,2,2,count

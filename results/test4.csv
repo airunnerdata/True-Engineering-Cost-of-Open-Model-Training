@@ -1,0 +1,5 @@
+Test,Platform,Scenario,Session,GPU,EFI,Wall_Clock,Services,Config_Files,CLI_Commands,Errors,Result
+4,AWS,Worst case: no capacity,aws_20260424T212637Z,p3.2xlarge (V100),49,2:38:56,6,3,5,10,DNF
+4,AWS,Best case: pre-probed,aws_20260425T154903Z,g5.xlarge (A10G),46,0:40:07,10,2,12,0,Complete
+4,Nebius,MK8S,nebius_20260426T143514Z,H100-SXM,43,0:48:24,7,1,14,3,Complete
+4,Crusoe,CMK,crusoe_20260430T152428Z,H100-SXM,33,0:34:26,7,1,10,0,Complete

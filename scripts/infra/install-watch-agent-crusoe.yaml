@@ -1,0 +1,52 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: watch-agent-installer
+  namespace: kube-system
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      hostPID: true
+      hostNetwork: true
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: installer
+          image: ubuntu:22.04
+          securityContext:
+            privileged: true
+          command:
+            - nsenter
+            - "--target"
+            - "1"
+            - "--mount"
+            - "--uts"
+            - "--ipc"
+            - "--net"
+            - "--pid"
+            - "--"
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              echo "[1/4] Writing monitoring token..."
+              mkdir -p /etc/crusoe/secrets
+              cat > /etc/crusoe/secrets/.monitoring-token <<'TOKENEOF'
+              CRUSOE_AUTH_TOKEN='MKwJMMS0Td2cGe_65aHqTg$2a$10$4vl4CPe6L/w7xl3xTxcnSOCy6gAXwqW4YFl3JX7Z06QD9qV2hVWCa'
+              TOKENEOF
+              chmod 600 /etc/crusoe/secrets/.monitoring-token
+              echo "[2/4] Downloading watch agent installer..."
+              cd /tmp
+              wget -q https://raw.githubusercontent.com/crusoecloud/crusoe-watch-agent/refs/heads/main/vm/crusoe_watch_agent.sh
+              chmod +x crusoe_watch_agent.sh
+              echo "[3/4] Installing watch agent (Docker mode)..."
+              ./crusoe_watch_agent.sh install
+              echo "[4/4] Done. Verifying..."
+              docker container logs crusoe-vector 2>&1 | tail -20 || true
+              systemctl status crusoe-watch-agent.service --no-pager || true
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+      restartPolicy: Never

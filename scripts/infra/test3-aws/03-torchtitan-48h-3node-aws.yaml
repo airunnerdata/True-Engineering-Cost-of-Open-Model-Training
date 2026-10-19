@@ -1,0 +1,367 @@
+# TorchTitan Llama 3.1 70B — 3-node 48h Goodput Test (AWS p6-b300)
+# 3 nodes x 8 B300 GPUs = 24 GPUs total, TP=8 + DP_shard=3
+# NVMe RAID0-backed NFS on master node for shared checkpoints
+# EFA (16 interfaces per node, 6.4 Tbps total) for cross-node NCCL
+#
+# PRE-TEST MANIFEST
+#   Model             : Llama 3.1 70B (llama3 / 70B)
+#   Parallelism       : TP=8, DP_shard=3 (24 GPUs total)
+#   Global batch size : 12 sequences x 8192 tokens = 98,304 tokens/step
+#   Checkpoint interval: 25 steps (async, NVMe RAID0 ~3-4s per 787GB ckpt)
+#   Dataset           : allenai/c4 (streamed)
+#   Hardware          : 3x AWS p6-b300.48xlarge (288 GB HBM3e, 8x B300 per node)
+#   Cluster           : surf-b300-aws (EKS us-west-2b)
+#   Reservation       : cr-0ab3244a0f33a81b4 (2026-06-09T11:30Z – 2026-06-11T11:30Z)
+#
+# BEFORE APPLYING: replace __MASTER_NODE__ below with the master node hostname.
+# Run: NODE=$(cat /tmp/surf-aws-master-node.txt) && \
+#      sed "s/__MASTER_NODE__/${NODE}/" 03-torchtitan-48h-3node-aws.yaml | kubectl apply -f - -n training
+#
+# NCCL / EFA NOTE:
+#   This YAML requests all 16 EFA interfaces per pod (vpc.amazonaws.com/efa: "16").
+#   The EFA device plugin is installed by eksctl (efaEnabled: true in cluster yaml).
+#   NCCL uses EFA via the aws-ofi-nccl plugin. If the torchtitan image does NOT
+#   include aws-ofi-nccl, NCCL falls back to TCP sockets (lower cross-node BW).
+#   To verify: kubectl logs <master-pod> | grep -i "ofi\|efa\|transport"
+#   If you see "OFI" transport → EFA RDMA is active. "NET/Socket" → TCP fallback.
+#   AWS DLC alternative image (has aws-ofi-nccl):
+#     763104351884.dkr.ecr.us-west-2.amazonaws.com/pytorch-training:2.6.0-gpu-py312-cu126-ubuntu22.04-ec2
+#
+# Apply:  see BEFORE APPLYING above
+# Logs:   kubectl logs -f -n training torchtitan-surf-n3b-aws-master-0
+# Steps:  kubectl logs -n training torchtitan-surf-n3b-aws-master-0 | grep "step:"
+# Clean:  kubectl delete pytorchjob torchtitan-surf-n3b-aws -n training
+#         kubectl delete configmap torchtitan-surf-n3b-aws-config -n training
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: torchtitan-surf-n3b-aws-config
+  namespace: training
+data:
+  train.toml: |
+    [job]
+    dump_folder = "/outputs"
+    description = "Surf Report — 70B 3-node 48h goodput AWS p6-b300, TP=8 DP_shard=3"
+
+    [profiling]
+    enable_profiling = false
+    save_traces_folder = "/outputs/profile_trace"
+    profile_freq = 100
+
+    [metrics]
+    log_freq = 50
+    enable_tensorboard = false
+
+    [model]
+    name = "llama3"
+    flavor = "70B"
+    hf_assets_path = "/workspace/torchtitan/assets/hf/Llama-3.1-8B"
+
+    [optimizer]
+    name = "AdamW"
+    lr = 3e-4
+    eps = 1e-8
+
+    [lr_scheduler]
+    warmup_steps = 200
+
+    [training]
+    local_batch_size = 4
+    seq_len = 8192
+    max_norm = 1.0
+    steps = 500000
+    dataset = "c4"
+
+    [parallelism]
+    data_parallel_replicate_degree = 1
+    data_parallel_shard_degree = 3
+    tensor_parallel_degree = 8
+    pipeline_parallel_degree = 1
+    context_parallel_degree = 1
+
+    [checkpoint]
+    enable = true
+    folder = "/outputs/checkpoint"
+    # interval=200 (not 25): on the AWS NVMe-RAID the 787GB distcp checkpoint GC
+    # delete takes ~150s and blocks training; at interval=25 that was ~60% overhead.
+    # 200 keeps checkpoint overhead ~13% (matches the Nebius adjustment).
+    interval = 200
+    keep_latest_k = 2
+    last_save_model_only = true
+    async_mode = "async"
+
+    [compile]
+    enable = true
+
+    [activation_checkpoint]
+    mode = "selective"
+
+    [comm]
+    init_timeout_seconds = 7200
+    train_timeout_seconds = 3600
+---
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: torchtitan-surf-n3b-aws
+  namespace: training
+spec:
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        spec:
+          # Pin master to the NFS/RAID node (same node the NFS server runs on)
+          nodeSelector:
+            kubernetes.io/hostname: __MASTER_NODE__
+          containers:
+            - name: pytorch
+              image: ghcr.io/datadoc24/torchtitan-llama3-8b:latest
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                capabilities:
+                  add: ["IPC_LOCK"]
+              workingDir: /workspace/torchtitan
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -o pipefail
+                  mkdir -p /outputs/checkpoint /tmp/hf_cache /tmp/pysite
+
+                  # Resolve MASTER_ADDR — retry until service DNS propagates
+                  FQDN="${MASTER_ADDR}.training.svc.cluster.local"
+                  for i in $(seq 1 30); do
+                    RESOLVED=$(getent hosts "$FQDN" 2>/dev/null | awk '{print $1}' | head -1)
+                    if [ -n "$RESOLVED" ]; then
+                      export MASTER_ADDR="$RESOLVED"
+                      echo "[rendezvous] MASTER_ADDR resolved: $FQDN -> $MASTER_ADDR"
+                      break
+                    fi
+                    echo "[rendezvous] DNS not ready (attempt $i/30)..."
+                    sleep 2
+                  done
+
+                  # Patch process group timeout to 2h (guards against slow EFA init)
+                  cat > /tmp/pysite/sitecustomize.py << 'PYEOF'
+                  try:
+                      import torch.distributed as dist
+                      from datetime import timedelta
+                      _orig = dist.init_process_group
+                      def _patched(*a, **kw):
+                          kw["timeout"] = timedelta(hours=2)
+                          return _orig(*a, **kw)
+                      dist.init_process_group = _patched
+                  except Exception:
+                      pass
+                  PYEOF
+
+                  # Ensure the OFI plugin can resolve libfabric (EFA) at load time
+                  export LD_LIBRARY_PATH=/opt/amazon/efa/lib:/opt/amazon/aws-ofi-nccl/lib:${LD_LIBRARY_PATH:-}
+                  HF_DATASETS_CACHE=/tmp/hf_cache \
+                  PYTHONPATH=/tmp/pysite:${PYTHONPATH:-} torchrun \
+                    --nproc_per_node=8 \
+                    --nnodes=3 \
+                    --node_rank=${RANK} \
+                    --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
+                    --rdzv_backend=c10d \
+                    -m torchtitan.train \
+                    --job.config_file /config/train.toml
+              env:
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-token
+                      key: token
+                - name: HF_DATASETS_CACHE
+                  value: "/tmp/hf_cache"
+                - name: PYTORCH_ALLOC_CONF
+                  value: "expandable_segments:True"
+                # --- EFA / NCCL ---
+                - name: NCCL_DEBUG
+                  value: "INFO"
+                - name: NCCL_SOCKET_IFNAME
+                  value: "eth"
+                # Force the AWS OFI/EFA NCCL plugin (image also ships IB/HPC-X
+                # plugins; without this NCCL may load the wrong one and fall to TCP)
+                - name: NCCL_NET_PLUGIN
+                  value: "/opt/amazon/aws-ofi-nccl/lib/libnccl-net-ofi.so"
+                - name: NCCL_IB_DISABLE
+                  value: "1"
+                # EFA RDMA via aws-ofi-nccl
+                - name: FI_PROVIDER
+                  value: "efa"
+                - name: FI_EFA_USE_DEVICE_RDMA
+                  value: "1"
+                - name: FI_EFA_FORK_SAFE
+                  value: "1"
+                - name: RDMAV_FORK_SAFE
+                  value: "1"
+                - name: NCCL_PROTO
+                  value: "simple"
+                - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+                  value: "7200"
+                - name: TORCH_DISTRIBUTED_TIMEOUT
+                  value: "7200"
+              resources:
+                limits:
+                  nvidia.com/gpu: "8"
+                  vpc.amazonaws.com/efa: "16"
+                  memory: "2048Gi"
+                  ephemeral-storage: "200Gi"
+                requests:
+                  nvidia.com/gpu: "8"
+                  vpc.amazonaws.com/efa: "16"
+                  memory: "2048Gi"
+                  ephemeral-storage: "200Gi"
+              volumeMounts:
+                - name: config
+                  mountPath: /config
+                - name: outputs
+                  mountPath: /outputs
+                - name: dshm
+                  mountPath: /dev/shm
+          volumes:
+            - name: config
+              configMap:
+                name: torchtitan-surf-n3b-aws-config
+            - name: outputs
+              persistentVolumeClaim:
+                claimName: surf-ckpt-pvc
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: "64Gi"
+
+    Worker:
+      replicas: 2
+      restartPolicy: OnFailure
+      template:
+        spec:
+          # Keep workers OFF the master's node (role=nfs-master) and one-per-node,
+          # so master + 2 workers each get a dedicated node (8 GPU each).
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: role
+                        operator: NotIn
+                        values: ["nfs-master"]
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      training.kubeflow.org/job-name: torchtitan-surf-n3b-aws
+                      training.kubeflow.org/replica-type: worker
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: pytorch
+              image: ghcr.io/datadoc24/torchtitan-llama3-8b:latest
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                capabilities:
+                  add: ["IPC_LOCK"]
+              workingDir: /workspace/torchtitan
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -o pipefail
+                  mkdir -p /outputs/checkpoint /tmp/hf_cache /tmp/pysite
+
+                  FQDN="${MASTER_ADDR}.training.svc.cluster.local"
+                  for i in $(seq 1 30); do
+                    RESOLVED=$(getent hosts "$FQDN" 2>/dev/null | awk '{print $1}' | head -1)
+                    if [ -n "$RESOLVED" ]; then
+                      export MASTER_ADDR="$RESOLVED"
+                      echo "[rendezvous] MASTER_ADDR resolved: $FQDN -> $MASTER_ADDR"
+                      break
+                    fi
+                    echo "[rendezvous] DNS not ready (attempt $i/30)..."
+                    sleep 2
+                  done
+
+                  cat > /tmp/pysite/sitecustomize.py << 'PYEOF'
+                  try:
+                      import torch.distributed as dist
+                      from datetime import timedelta
+                      _orig = dist.init_process_group
+                      def _patched(*a, **kw):
+                          kw["timeout"] = timedelta(hours=2)
+                          return _orig(*a, **kw)
+                      dist.init_process_group = _patched
+                  except Exception:
+                      pass
+                  PYEOF
+
+                  # Ensure the OFI plugin can resolve libfabric (EFA) at load time
+                  export LD_LIBRARY_PATH=/opt/amazon/efa/lib:/opt/amazon/aws-ofi-nccl/lib:${LD_LIBRARY_PATH:-}
+                  HF_DATASETS_CACHE=/tmp/hf_cache \
+                  PYTHONPATH=/tmp/pysite:${PYTHONPATH:-} torchrun \
+                    --nproc_per_node=8 \
+                    --nnodes=3 \
+                    --node_rank=${RANK} \
+                    --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
+                    --rdzv_backend=c10d \
+                    -m torchtitan.train \
+                    --job.config_file /config/train.toml
+              env:
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-token
+                      key: token
+                - name: HF_DATASETS_CACHE
+                  value: "/tmp/hf_cache"
+                - name: PYTORCH_ALLOC_CONF
+                  value: "expandable_segments:True"
+                - name: NCCL_DEBUG
+                  value: "INFO"
+                - name: NCCL_SOCKET_IFNAME
+                  value: "eth"
+                - name: FI_PROVIDER
+                  value: "efa"
+                - name: FI_EFA_USE_DEVICE_RDMA
+                  value: "1"
+                - name: FI_EFA_FORK_SAFE
+                  value: "1"
+                - name: RDMAV_FORK_SAFE
+                  value: "1"
+                - name: NCCL_PROTO
+                  value: "simple"
+                - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+                  value: "7200"
+                - name: TORCH_DISTRIBUTED_TIMEOUT
+                  value: "7200"
+              resources:
+                limits:
+                  nvidia.com/gpu: "8"
+                  vpc.amazonaws.com/efa: "16"
+                  memory: "2048Gi"
+                  ephemeral-storage: "200Gi"
+                requests:
+                  nvidia.com/gpu: "8"
+                  vpc.amazonaws.com/efa: "16"
+                  memory: "2048Gi"
+                  ephemeral-storage: "200Gi"
+              volumeMounts:
+                - name: config
+                  mountPath: /config
+                - name: outputs
+                  mountPath: /outputs
+                - name: dshm
+                  mountPath: /dev/shm
+          volumes:
+            - name: config
+              configMap:
+                name: torchtitan-surf-n3b-aws-config
+            - name: outputs
+              persistentVolumeClaim:
+                claimName: surf-ckpt-pvc
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: "64Gi"

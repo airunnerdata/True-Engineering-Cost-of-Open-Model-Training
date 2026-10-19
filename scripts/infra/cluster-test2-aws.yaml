@@ -1,0 +1,26 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: surf-aws-t2
+  region: us-west-2
+  version: "1.32"
+
+vpc:
+  id: vpc-bc27efd9
+  subnets:
+    public:
+      us-west-2a: { id: subnet-f316b296 }
+      us-west-2b: { id: subnet-3d62984a }
+      us-west-2c: { id: subnet-37d2c871 }
+      us-west-2d: { id: subnet-978cb4bf }
+
+managedNodeGroups:
+  - name: gpu-nodes
+    instanceType: g5.xlarge
+    minSize: 0
+    maxSize: 1
+    desiredCapacity: 1
+    iam:
+      withAddonPolicies:
+        imageBuilder: true

@@ -1,0 +1,65 @@
+# Checkpoint GC DaemonSet
+# Runs ONLY on master node (nodeSelector), sweeps /mnt/torchtitan-ckpt/checkpoint/
+# every 5 min, keeping only the 3 newest step-* directories.
+#
+# Purpose: TorchTitan's checkpoint cleanup (keep_latest_k) only runs on rank 0.
+# With NFS-shared checkpoint storage, only one GC is needed (master side).
+# Running on worker would cause races on the shared NFS path.
+#
+# Apply: kubectl apply -f scripts/infra/test3/00-ckpt-gc-daemonset.yaml -n training
+# Check: kubectl get pods -n training -l app=ckpt-gc -o wide
+# Logs:  kubectl logs -n training -l app=ckpt-gc --tail=10
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ckpt-gc
+  namespace: training
+spec:
+  selector:
+    matchLabels:
+      app: ckpt-gc
+  template:
+    metadata:
+      labels:
+        app: ckpt-gc
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: np-5a337c1f-2.eu-iceland1-a.compute.internal
+      tolerations:
+        - operator: Exists
+      priorityClassName: system-node-critical
+      volumes:
+        - name: ckpt
+          hostPath:
+            path: /mnt/torchtitan-ckpt
+            type: DirectoryOrCreate
+      containers:
+        - name: gc
+          image: busybox
+          command:
+            - sh
+            - -c
+            - |
+              while true; do
+                DIRS=$(ls -d /ckpt/checkpoint/step-* 2>/dev/null | sort -t- -k2 -n)
+                COUNT=$(echo "$DIRS" | grep -c . 2>/dev/null || echo 0)
+                if [ "$COUNT" -gt 3 ]; then
+                  TO_DELETE=$(echo "$DIRS" | head -n $(($COUNT - 3)))
+                  echo "[ckpt-gc] $(date -u) purging $(echo "$TO_DELETE" | wc -l) old dirs:"
+                  echo "$TO_DELETE"
+                  echo "$TO_DELETE" | xargs rm -rf
+                  echo "[ckpt-gc] done. Remaining: $(ls /ckpt/checkpoint/ 2>/dev/null | tr '\n' ' ')"
+                fi
+                sleep 300
+              done
+          volumeMounts:
+            - name: ckpt
+              mountPath: /ckpt
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"

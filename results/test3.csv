@@ -1,0 +1,30 @@
+Test 3: Goodput,Metric,Crusoe (B300),Nebius (B200),AWS (B300)
+Shared Parameters,Model,Llama 3.1 70B,Llama 3.1 70B,Llama 3.1 70B
+,Parameters,"70,553,706,496","70,553,706,496","70,553,706,496"
+,Framework,TorchTitan (torchtitan.train),TorchTitan (torchtitan.train),TorchTitan (torchtitan.train)
+,Dataset,allenai/c4 (via HuggingFace XetHub),allenai/c4 (via HuggingFace XetHub),allenai/c4 (via HuggingFace XetHub)
+,Nodes,3,3,3
+,GPUs Per Node,8,8,8
+,Total GPUs,24,24,24
+,Duration (hours),48,48,48
+,Sequence length (tokens),"8,192","8,192","8,192"
+,Checkpoint interval (steps),200,200,200
+,Parallelism,"TP=8, DP_shard=3","TP=8, DP_shard=3","TP=8, DP_shard=3"
+,Local batch size (seq/group),4,4,4
+,Global batch size (seq),12 (4 x DP_shard=3),12 (4 x DP_shard=3),12 (4 x DP_shard=3)
+Run Summary,T0 (first step),2026-05-27T21:17:10Z,2026-06-03T09:47.12Z,2026-06-09T14:58:49Z
+,Run end / terminated,2026-05-29T21:17:10Z,2026-06-05T09:47.12Z,2026-06-11T14:58:49Z
+,Region,eu-iceland1-a,me-west1-a,us-west-2b
+,Hardware,3x B300 SXM6 (288 GB HBM3e),3x B200 SXM (180 GB HBM3e),3x p6-b300.48xlarge (B300 288 GB HBM3e)
+,Interconnect,InfiniBand,InfiniBand,EFA (16 NIC/node RDMA)
+,Checkpoint storage,NFS-shared NVMe,SSD shared filesystem,NVMe RAID0 NFS (8x3.8TB)
+,Checkpoint size (GB),787,789,787
+Performance Metrics,Final step,"36,150","26,100","31,300"
+,Peak MFU,51.90%,32.70%,41.30%
+,Avg / steady MFU,36.70%,27.50%,34.80%
+,Max logged MFU,57.50%,46.90%,49.80%
+,Avg tokens/sec,"1,653","1,284","1,425"
+,Avg TFLOPs/GPU,887,618,780
+,Step time (sec/step),4.71,6.45,5.3
+Official Test 3 Metrics,Goodput ratio,99.10%,94.20%,95.90%
+,MTTR (min),8.2,13.7,12.7

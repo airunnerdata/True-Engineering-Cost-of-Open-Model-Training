@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: surf-train-script
+  namespace: training
+data:
+  surf_train.py: |
+    import os, sys, time, torch
+
+    PAUSE_FILE  = "/tmp/surf_pause"
+    CKPT_DIR    = "/tmp/checkpoints"
+    TOTAL_STEPS = 20000
+    CKPT_EVERY  = 100
+    MATRIX_SIZE = 2048
+
+    os.makedirs(CKPT_DIR, exist_ok=True)
+
+    if not torch.cuda.is_available():
+        print("ERROR: no CUDA device found", flush=True)
+        sys.exit(1)
+
+    device      = torch.device("cuda")
+    device_name = torch.cuda.get_device_name(0)
+    print(f"Device: {device} ({device_name})", flush=True)
+    print(f"Total steps: {TOTAL_STEPS}  checkpoint every: {CKPT_EVERY}", flush=True)
+    print(f"Pause hook:  touch {PAUSE_FILE} to hang, rm to resume", flush=True)
+    print(flush=True)
+
+    torch.manual_seed(42)
+    x = torch.randn(MATRIX_SIZE, MATRIX_SIZE, device=device)
+    w = torch.nn.Parameter(torch.randn(MATRIX_SIZE, MATRIX_SIZE, device=device))
+    optimizer = torch.optim.SGD([w], lr=0.01, momentum=0.9)
+
+    for step in range(TOTAL_STEPS):
+        if os.path.exists(PAUSE_FILE):
+            print(f"PAUSED at step={step} — waiting for {PAUSE_FILE} removal", flush=True)
+            while os.path.exists(PAUSE_FILE):
+                time.sleep(5)
+            print(f"RESUMED at step={step}", flush=True)
+
+        # GPU busy-loop: keep GPU at ~90% utilization for meaningful MFU measurement
+        step_start = time.time()
+        optimizer.zero_grad()
+        while time.time() - step_start < 0.9:
+            out = x @ w
+        loss = out.mean() + 1e-4 * w.pow(2).mean()
+        loss.backward()
+        optimizer.step()
+        loss_val = loss.item()
+
+        elapsed = time.time() - step_start
+        if elapsed < 1.0:
+            time.sleep(1.0 - elapsed)
+
+        if step % CKPT_EVERY == 0:
+            ckpt_path = os.path.join(CKPT_DIR, f"ckpt_{step:04d}.pt")
+            torch.save({"step": step, "loss": loss_val, "w": w.data.cpu()}, ckpt_path)
+            print(f"CHECKPOINT step={step} loss={loss_val:.4f} device={device_name}", flush=True)
+        else:
+            print(f"step={step} loss={loss_val:.4f}", flush=True)
+
+    print("Training complete", flush=True)

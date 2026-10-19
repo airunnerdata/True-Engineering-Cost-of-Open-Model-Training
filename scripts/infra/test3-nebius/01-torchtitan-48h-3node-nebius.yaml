@@ -1,0 +1,372 @@
+# TorchTitan Llama 3.1 70B — 3-Node 48-hour Goodput Test (Nebius B200)
+# 3 nodes × 8 B200 GPUs = 24 GPUs total, TP=8 + DP_shard=3
+# Shared NFS checkpoint storage (in-cluster NFS server @ 10.147.146.1)
+# Streams C4 dataset from HuggingFace
+#
+# PRE-TEST MANIFEST
+#   Model             : Llama 3.1 70B (llama3 / 70B)
+#   Parallelism       : TP=8, DP_shard=3 (24 GPUs total)
+#   Global batch size : 12 sequences × 8192 tokens = 98,304 tokens/step
+#   Checkpoint interval: 200 steps (async; ~789GB full-state ckpt over NFS ~44min)
+#   Dataset           : allenai/c4 (streamed)
+#   Hardware          : 3× Nebius B200 (180 GB HBM each), InfiniBand (me-west1-a)
+#   Cluster           : mk8scluster-i00yh47gwapc8t3dnb (surf-b200-mew1, k8s 1.31)
+#
+# Apply:  kubectl apply -f scripts/infra/test3-nebius/01-torchtitan-48h-3node-nebius.yaml -n training
+# Logs:   kubectl logs -f -n training torchtitan-surf-n3b-master-0
+# Steps:  kubectl logs -n training torchtitan-surf-n3b-master-0 | grep "step:"
+# Clean:  kubectl delete -f scripts/infra/test3-nebius/01-torchtitan-48h-3node-nebius.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: training
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: surf-ckpt-pv
+spec:
+  capacity:
+    storage: 4096Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  nfs:
+    server: 10.147.146.1
+    path: /exports
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: surf-ckpt-pvc
+  namespace: training
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 4096Gi
+  volumeName: surf-ckpt-pv
+  storageClassName: ""
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: torchtitan-surf-n3b-config
+  namespace: training
+data:
+  train.toml: |
+    [job]
+    dump_folder = "/outputs"
+    description = "Surf Report — 70B 3-node 48h goodput Nebius B200, TP=8 DP_shard=3"
+
+    [profiling]
+    enable_profiling = false
+    save_traces_folder = "/outputs/profile_trace"
+    profile_freq = 100
+
+    [metrics]
+    log_freq = 50
+    enable_tensorboard = false
+
+    [model]
+    name = "llama3"
+    flavor = "70B"
+    hf_assets_path = "/workspace/torchtitan/assets/hf/Llama-3.1-8B"
+
+    [optimizer]
+    name = "AdamW"
+    lr = 3e-4
+    eps = 1e-8
+
+    [lr_scheduler]
+    warmup_steps = 200
+
+    [training]
+    local_batch_size = 4
+    seq_len = 8192
+    max_norm = 1.0
+    steps = 500000
+    dataset = "c4"
+
+    [parallelism]
+    data_parallel_replicate_degree = 1
+    data_parallel_shard_degree = 3
+    tensor_parallel_degree = 8
+    pipeline_parallel_degree = 1
+    context_parallel_degree = 1
+
+    [checkpoint]
+    enable = true
+    folder = "/outputs/checkpoint"
+    interval = 200
+    keep_latest_k = 2
+    last_save_model_only = true
+    async_mode = "async"
+
+    [compile]
+    enable = true
+
+    [activation_checkpoint]
+    mode = "selective"
+
+    [comm]
+    init_timeout_seconds = 7200
+    train_timeout_seconds = 3600
+---
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: torchtitan-surf-n3b
+  namespace: training
+spec:
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        spec:
+          nodeSelector:
+            kubernetes.io/hostname: computeinstance-i00dmp4ry7e1nfhd87
+          # No hostNetwork — use pod networking for c10d rendezvous (Cilium CNI)
+          # NCCL accesses IB via /dev/infiniband hostPath without needing host netns
+          containers:
+            - name: pytorch
+              image: ghcr.io/datadoc24/torchtitan-llama3-8b:latest
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                capabilities:
+                  add: ["IPC_LOCK"]
+              workingDir: /workspace/torchtitan
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -o pipefail
+                  mkdir -p /outputs/checkpoint /tmp/hf_cache /tmp/pysite
+
+                  # Resolve MASTER_ADDR — retry until service DNS propagates (up to 60s)
+                  FQDN="${MASTER_ADDR}.training.svc.cluster.local"
+                  for i in $(seq 1 30); do
+                    RESOLVED=$(getent hosts "$FQDN" 2>/dev/null | awk '{print $1}' | head -1)
+                    if [ -n "$RESOLVED" ]; then
+                      export MASTER_ADDR="$RESOLVED"
+                      echo "[rendezvous] MASTER_ADDR resolved: $FQDN -> $MASTER_ADDR"
+                      break
+                    fi
+                    echo "[rendezvous] DNS not ready (attempt $i/30)..."
+                    sleep 2
+                  done
+
+                  cat > /tmp/pysite/sitecustomize.py << 'PYEOF'
+                  try:
+                      import torch.distributed as dist
+                      from datetime import timedelta
+                      _orig = dist.init_process_group
+                      def _patched(*a, **kw):
+                          kw["timeout"] = timedelta(hours=2)
+                          return _orig(*a, **kw)
+                      dist.init_process_group = _patched
+                  except Exception:
+                      pass
+                  PYEOF
+
+                  HF_DATASETS_CACHE=/tmp/hf_cache \
+                  PYTHONPATH=/tmp/pysite:${PYTHONPATH:-} torchrun \
+                    --nproc_per_node=8 \
+                    --nnodes=3 \
+                    --node_rank=${RANK} \
+                    --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
+                    --rdzv_backend=c10d \
+                    -m torchtitan.train \
+                    --job.config_file /config/train.toml
+              env:
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-token
+                      key: token
+                - name: HF_DATASETS_CACHE
+                  value: "/tmp/hf_cache"
+                - name: PYTORCH_ALLOC_CONF
+                  value: "expandable_segments:True"
+                - name: NCCL_DEBUG
+                  value: "INFO"
+                - name: NCCL_SOCKET_IFNAME
+                  value: "eth"
+                - name: NCCL_IB_DISABLE
+                  value: "0"
+                - name: NCCL_IB_GID_INDEX
+                  value: "3"
+                - name: NCCL_NET_GDR_LEVEL
+                  value: "2"
+                - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+                  value: "7200"
+                - name: TORCH_DISTRIBUTED_TIMEOUT
+                  value: "7200"
+              resources:
+                limits:
+                  nvidia.com/gpu: "8"
+                  memory: "1536Gi"
+                  ephemeral-storage: "50Gi"
+                requests:
+                  nvidia.com/gpu: "8"
+                  memory: "1536Gi"
+                  ephemeral-storage: "50Gi"
+              volumeMounts:
+                - name: config
+                  mountPath: /config
+                - name: outputs
+                  mountPath: /outputs
+                - name: dshm
+                  mountPath: /dev/shm
+                - name: infiniband
+                  mountPath: /dev/infiniband
+          volumes:
+            - name: config
+              configMap:
+                name: torchtitan-surf-n3b-config
+            - name: outputs
+              persistentVolumeClaim:
+                claimName: surf-ckpt-pvc
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: "64Gi"
+            - name: infiniband
+              hostPath:
+                path: /dev/infiniband
+                type: Directory
+
+    Worker:
+      replicas: 2
+      restartPolicy: OnFailure
+      template:
+        spec:
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: kubernetes.io/hostname
+                        operator: In
+                        values:
+                          - computeinstance-i00f5yjsqqe74nrkk0
+                          - computeinstance-i00tp7t2enjw1cwtha
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      training.kubeflow.org/job-name: torchtitan-surf-n3b
+                      training.kubeflow.org/replica-type: worker
+                  topologyKey: kubernetes.io/hostname
+          # No hostNetwork — use pod networking for c10d rendezvous (Cilium CNI)
+          # NCCL accesses IB via /dev/infiniband hostPath without needing host netns
+          containers:
+            - name: pytorch
+              image: ghcr.io/datadoc24/torchtitan-llama3-8b:latest
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                capabilities:
+                  add: ["IPC_LOCK"]
+              workingDir: /workspace/torchtitan
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -o pipefail
+                  mkdir -p /outputs/checkpoint /tmp/hf_cache /tmp/pysite
+
+                  # Resolve MASTER_ADDR — retry until service DNS propagates (up to 60s)
+                  FQDN="${MASTER_ADDR}.training.svc.cluster.local"
+                  for i in $(seq 1 30); do
+                    RESOLVED=$(getent hosts "$FQDN" 2>/dev/null | awk '{print $1}' | head -1)
+                    if [ -n "$RESOLVED" ]; then
+                      export MASTER_ADDR="$RESOLVED"
+                      echo "[rendezvous] MASTER_ADDR resolved: $FQDN -> $MASTER_ADDR"
+                      break
+                    fi
+                    echo "[rendezvous] DNS not ready (attempt $i/30)..."
+                    sleep 2
+                  done
+
+                  cat > /tmp/pysite/sitecustomize.py << 'PYEOF'
+                  try:
+                      import torch.distributed as dist
+                      from datetime import timedelta
+                      _orig = dist.init_process_group
+                      def _patched(*a, **kw):
+                          kw["timeout"] = timedelta(hours=2)
+                          return _orig(*a, **kw)
+                      dist.init_process_group = _patched
+                  except Exception:
+                      pass
+                  PYEOF
+
+                  HF_DATASETS_CACHE=/tmp/hf_cache \
+                  PYTHONPATH=/tmp/pysite:${PYTHONPATH:-} torchrun \
+                    --nproc_per_node=8 \
+                    --nnodes=3 \
+                    --node_rank=${RANK} \
+                    --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
+                    --rdzv_backend=c10d \
+                    -m torchtitan.train \
+                    --job.config_file /config/train.toml
+              env:
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-token
+                      key: token
+                - name: HF_DATASETS_CACHE
+                  value: "/tmp/hf_cache"
+                - name: PYTORCH_ALLOC_CONF
+                  value: "expandable_segments:True"
+                - name: NCCL_DEBUG
+                  value: "INFO"
+                - name: NCCL_SOCKET_IFNAME
+                  value: "eth"
+                - name: NCCL_IB_DISABLE
+                  value: "0"
+                - name: NCCL_IB_GID_INDEX
+                  value: "3"
+                - name: NCCL_NET_GDR_LEVEL
+                  value: "2"
+                - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+                  value: "7200"
+                - name: TORCH_DISTRIBUTED_TIMEOUT
+                  value: "7200"
+              resources:
+                limits:
+                  nvidia.com/gpu: "8"
+                  memory: "1536Gi"
+                  ephemeral-storage: "50Gi"
+                requests:
+                  nvidia.com/gpu: "8"
+                  memory: "1536Gi"
+                  ephemeral-storage: "50Gi"
+              volumeMounts:
+                - name: config
+                  mountPath: /config
+                - name: outputs
+                  mountPath: /outputs
+                - name: dshm
+                  mountPath: /dev/shm
+                - name: infiniband
+                  mountPath: /dev/infiniband
+          volumes:
+            - name: config
+              configMap:
+                name: torchtitan-surf-n3b-config
+            - name: outputs
+              persistentVolumeClaim:
+                claimName: surf-ckpt-pvc
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: "64Gi"
+            - name: infiniband
+              hostPath:
+                path: /dev/infiniband
+                type: Directory
