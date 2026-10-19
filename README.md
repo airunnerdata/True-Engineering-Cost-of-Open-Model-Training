@@ -20,7 +20,7 @@ A structured benchmark comparing three GPU cloud platforms - **AWS**, **Crusoe C
 
 Measures the operational burden placed on an ML engineering team when GPU training failures occur. Four failure scenarios (OOM Kill, Pod Eviction, Silent GPU Hang, Node Cordon) are injected into a live training job. Alert detection time and manual recovery effort are measured via structured harness logging.
 
-**Key metric**: Operational Burden Score (OBS) = Σ(alert_lag_min x 2) + Σ(manual_steps x 1), 60-min penalty for no automated detection.
+**Key metric**: Operational Burden Score (OBS) = Σ(alert_lag_min x 2), 60-min penalty for no automated detection.
 
 | Platform | Scenario | Alerts Fired | OBS Score | Avg Alert Lag |
 |----------|----------|:---:|---:|---:|
@@ -78,7 +78,7 @@ Measures **goodput** - the fraction of paid GPU time that produces useful forwar
 | Platform | $ per GPU-hour | $ per Effective TFLOP-hour |
 |----------|---------------:|-----------------:|
 | Crusoe Cloud (B300) | 8.96 | **0.01019** |
-| Gold Tier Neocloud (B200) | **7.15** | 0.01128 |
+| Gold Tier Neocloud (B200) | **7.15** | 0.01228 |
 | AWS (B300) | 11.70 | 0.01564 |
 
 > $ per TFLOP-hour normalizes for throughput (achieved TFLOPs/GPU): Crusoe Cloud delivers the lowest cost per unit of compute despite a higher GPU-hour rate than Gold Tier Neocloud's B200.
@@ -115,7 +115,7 @@ Forward-looking total return on investment for a team running the Test 3 workloa
 | Platform | Team (FTE) | Labor / yr | Compute / yr | **Total TCO / yr** | % over Crusoe Cloud |
 |----------|----------:|-----------:|-------------:|-------------------:|--------------:|
 | **Crusoe Cloud (B300)** | 3.89 | $711,236 | $1,082,798 | **$1,794,034** | — |
-| Gold Tier Neocloud (B200) | 4.90 | $749,244 | $1,305,761 | $2,055,005 | +13% |
+| Gold Tier Neocloud (B200) | 4.09 | $749,244 | $1,305,761 | $2,055,005 | +15% |
 | AWS (B300) | 6.28 | $1,149,029 | $1,662,148 | $2,811,177 | +56% |
 
 Crusoe Cloud is lowest on **both** axes: its B300 throughput (879 Effective TFLOPs/GPU) plus competitive `$/TFLOP-hour` minimizes compute, while a streamlined provision/teardown/incident path needs ~2 fewer engineers than AWS. 
