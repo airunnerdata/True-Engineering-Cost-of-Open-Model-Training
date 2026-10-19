@@ -16,25 +16,45 @@ A structured benchmark comparing three GPU cloud platforms - **AWS**, **Crusoe C
 
 ## Tests
 
-### Test 1 - Managed Orchestration / Operational Burden
+### The Deployment Race Test
 
-Measures the operational burden placed on an ML engineering team when GPU training failures occur. Four failure scenarios (OOM Kill, Pod Eviction, Silent GPU Hang, Node Cordon) are injected into a live training job. Alert detection time and manual recovery effort are measured via structured harness logging.
+Measures wall-clock time and engineering complexity to deploy a GPU training workload from a cold account start to a first verified training step. The test answers the question a new ML engineer faces on day one: *how long does it actually take to get a GPU running a training job?*
 
-**Key metric**: Operational Burden Score (OBS) = Σ(alert_lag_min x 2), 60-min penalty for no automated detection.
+**Key metrics**: Wall-clock time (minutes) and Engineering Friction Index (EFI) = (services x 3) + (config files x 2) + (CLI commands x 1) + (errors x 2).
 
-| Platform | Scenario | Alerts Fired | OBS Score | Avg Alert Lag |
-|----------|----------|:---:|---:|---:|
-| AWS | Misconfigured CloudWatch | 0 / 4 | 480 | - |
-| AWS | Corrected CloudWatch | 4 / 4 | 52.1 | 6.5 min |
-| Gold Tier Neocloud | mk8s + built-in dashboard | 4 / 4 | 13.9 | 1.7 min |
-| Crusoe Cloud | CMK + Command Center | 4 / 4 | **8.4** | **1.1 min** |
+| Platform | Scenario | EFI | Wall Clock | Result |
+|----------|----------|---:|---:|---:|
+| AWS | Worst case - p3.2xlarge, no capacity | 49 | DNF | Did not finish |
+| AWS | Best case - g5.xlarge, pre-probed | 46 | 40:07 | ✓ |
+| Gold Tier Neocloud | mk8s with H100 SXM | 43 | 48:24 | ✓ |
+| Crusoe Cloud | CMK with H100 SXM | **33** | **34:26** | ✓ |
 
-- [Methodology > methods/test1.md](methods/test1.md)
-- [Metrics > results/test1.csv](results/test1.csv)
+- [Methodology > methods/test4.md](methods/test4.md)
+- [Metrics > results/test4.csv](results/test4.csv)
+
+## Deployment Steps
+
+Step-by-step logs of every action taken during each test, tagged by milestone, EFI type (service / config\_file / cli\_command / error), and story points. Covers both tests across all three platforms.
+
+| Test | Platform | Steps | Points | Errors | Notes |
+|------|----------|------:|------:|------:|-------|
+| 1 | AWS | 21 | 49 | 4 | CloudWatch alarm setup required 4 iterative fixes before all alarms reached OK state |
+| 1 | Gold Tier Neocloud | 5 | 7 | 0 | Built-in dashboard required no setup |
+| 1 | Crusoe Cloud | 5 | 7 | 0 | Command Center required no setup |
+| 2 | AWS-CLI | 8 | 19 | 1 | eksctl abstracts IAM/VPC/nodegroup into 2 config files; EFI=13 |
+| 2 | AWS-Console | 11 | 29 | 1 | Manual IAM role creation required for cluster + nodegroup; EFI=28 |
+| 2 | Gold Tier Neocloud | 8 | 15 | 0 | Console-only; GPU Operator pre-installed via node image; EFI=20 |
+| 2 | Crusoe Cloud | 8 | 15 | 0 | Console-only; GPU Operator pre-installed as cluster add-on; EFI=18 |
+| 4 | AWS | 33 | 96 | 0 | Includes VPC, IRSA, OIDC, GPU nodegroup provisioning from cold account |
+| 4 | Gold Tier Neocloud | 22 | 42 | 1 | GPU Operator required via Helm; standalone device plugin unsupported |
+| 4 | Crusoe Cloud | 20 | 38 | 1 | CCR image push blocked; pivoted to public pytorch image |
+
+[results/deployment_steps.csv](results/deployment_steps.csv)
+
 
 ---
 
-### Test 2 - GPU Provisioning Friction & Sustained Performance
+### Provisioning & Scaling Test
 
 Measures cluster provisioning complexity (EFI) from scratch to a running GPU training job, plus sustained GPU utilization (MFU) over a 4 hour window. Time-to-first-GPU and node scale-out latency are also captured.
 
@@ -56,7 +76,26 @@ Each platform was measured in both CLI and console modes. CLI provisioning lower
 
 ---
 
-### Test 3 - Goodput Stability
+
+### Operational Burden Test
+
+Measures the operational burden placed on an ML engineering team when GPU training failures occur. Four failure scenarios (OOM Kill, Pod Eviction, Silent GPU Hang, Node Cordon) are injected into a live training job. Alert detection time and manual recovery effort are measured via structured harness logging.
+
+**Key metric**: Operational Burden Score (OBS) = Σ(alert_lag_min x 2), 60-min penalty for no automated detection.
+
+| Platform | Scenario | Alerts Fired | OBS Score | Avg Alert Lag |
+|----------|----------|:---:|---:|---:|
+| AWS | Misconfigured CloudWatch | 0 / 4 | 480 | - |
+| AWS | Corrected CloudWatch | 4 / 4 | 52.1 | 6.5 min |
+| Gold Tier Neocloud | mk8s + built-in dashboard | 4 / 4 | 13.9 | 1.7 min |
+| Crusoe Cloud | CMK + Command Center | 4 / 4 | **8.4** | **1.1 min** |
+
+- [Methodology > methods/test1.md](methods/test1.md)
+- [Metrics > results/test1.csv](results/test1.csv)
+
+---
+
+### Goodput Stability Test
 
 Measures **goodput** - the fraction of paid GPU time that produces useful forward training progress - on a 48-hour multi-node Llama 3.1 70B (TorchTitan, TP=8 x DP_shard=3, 24 GPUs) run subjected to repeated infrastructure failures. Three failures are injected at T+4h, T+12h, and T+24h (pod eviction, node cordon + eviction, pod eviction) and recovery is measured from checkpoint.
 
@@ -88,25 +127,7 @@ Measures **goodput** - the fraction of paid GPU time that produces useful forwar
 
 ---
 
-### Test 4 - The Deployment Race
-
-Measures wall-clock time and engineering complexity to deploy a GPU training workload from a cold account start to a first verified training step. The test answers the question a new ML engineer faces on day one: *how long does it actually take to get a GPU running a training job?*
-
-**Key metrics**: Wall-clock time (minutes) and Engineering Friction Index (EFI) = (services x 3) + (config files x 2) + (CLI commands x 1) + (errors x 2).
-
-| Platform | Scenario | EFI | Wall Clock | Result |
-|----------|----------|---:|---:|---:|
-| AWS | Worst case - p3.2xlarge, no capacity | 49 | DNF | Did not finish |
-| AWS | Best case - g5.xlarge, pre-probed | 46 | 40:07 | ✓ |
-| Gold Tier Neocloud | mk8s with H100 SXM | 43 | 48:24 | ✓ |
-| Crusoe Cloud | CMK with H100 SXM | **33** | **34:26** | ✓ |
-
-- [Methodology > methods/test4.md](methods/test4.md)
-- [Metrics > results/test4.csv](results/test4.csv)
-
----
-
-## 1-Year ROI
+## Total Cost of Ownership & Return on Investment
 
 Forward-looking total return on investment for a team running the Test 3 workload (Llama 3.1 70B, 24 GPUs) **on-demand** — provision → 48 h run → teardown — combining **labor** (from measured deployment story points) and **workload-normalized compute** (cost to complete the same training job, governed by `$/TFLOP-hour`). Constants: 10 pts/FTE-week, $183,000 fully-burdened salary.
 
@@ -122,27 +143,6 @@ Crusoe Cloud is lowest on **both** axes: its B300 throughput (879 Effective TFLO
 
 - [Methodology > methods/tco-1yr.md](methods/tco-1yr.md)
 - [Model > results/tco-1yr.csv](results/tco-1yr.csv)
-
----
-
-## Deployment Steps
-
-Step-by-step logs of every action taken during each test, tagged by milestone, EFI type (service / config\_file / cli\_command / error), and story points. Covers both tests across all three platforms.
-
-| Test | Platform | Steps | Points | Errors | Notes |
-|------|----------|------:|------:|------:|-------|
-| 1 | AWS | 21 | 49 | 4 | CloudWatch alarm setup required 4 iterative fixes before all alarms reached OK state |
-| 1 | Gold Tier Neocloud | 5 | 7 | 0 | Built-in dashboard required no setup |
-| 1 | Crusoe Cloud | 5 | 7 | 0 | Command Center required no setup |
-| 2 | AWS-CLI | 8 | 19 | 1 | eksctl abstracts IAM/VPC/nodegroup into 2 config files; EFI=13 |
-| 2 | AWS-Console | 11 | 29 | 1 | Manual IAM role creation required for cluster + nodegroup; EFI=28 |
-| 2 | Gold Tier Neocloud | 8 | 15 | 0 | Console-only; GPU Operator pre-installed via node image; EFI=20 |
-| 2 | Crusoe Cloud | 8 | 15 | 0 | Console-only; GPU Operator pre-installed as cluster add-on; EFI=18 |
-| 4 | AWS | 33 | 96 | 0 | Includes VPC, IRSA, OIDC, GPU nodegroup provisioning from cold account |
-| 4 | Gold Tier Neocloud | 22 | 42 | 1 | GPU Operator required via Helm; standalone device plugin unsupported |
-| 4 | Crusoe Cloud | 20 | 38 | 1 | CCR image push blocked; pivoted to public pytorch image |
-
-[results/deployment_steps.csv](results/deployment_steps.csv)
 
 ---
 
